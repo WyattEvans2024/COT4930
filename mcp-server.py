@@ -2,7 +2,7 @@ import hashlib
 import json
 from typing import Literal
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 
 mcp = FastMCP("text-tools")
