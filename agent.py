@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import sys
 from contextlib import AsyncExitStack
@@ -11,6 +12,8 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+
+logging.getLogger("langchain_google_genai._function_utils").setLevel(logging.ERROR)
 
 PROJECT_DIR = Path(__file__).resolve().parent
 SANDBOX_DIR = PROJECT_DIR / "sandbox"

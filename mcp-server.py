@@ -91,4 +91,4 @@ def validate_json(text: str) -> dict[str, object]:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    mcp.run(transport="stdio", log_level="WARNING")
