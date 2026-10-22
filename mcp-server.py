@@ -5,7 +5,7 @@ from typing import Literal
 from mcp.server.fastmcp import FastMCP
 
 
-mcp = FastMCP("text-tools")
+mcp = FastMCP("text-tools", log_level="WARNING")
 
 
 @mcp.tool()
@@ -91,4 +91,4 @@ def validate_json(text: str) -> dict[str, object]:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio", log_level="WARNING")
+    mcp.run(transport="stdio")
