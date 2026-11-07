@@ -30,7 +30,10 @@ map. Only the Python standard library is used.
 from __future__ import annotations
 
 import argparse
+import asyncio
+import getpass
 import ipaddress
+import os
 import platform
 import re
 import socket
@@ -146,6 +149,9 @@ class HostResult:
         vendor: The hardware vendor resolved from the MAC's OUI, or ``None``.
         hostname: The reverse-DNS name, or ``None`` if none resolved.
         device_type: A best-guess device category.
+        switch: IP of the switch this device is attached to, from SNMP, or
+            ``None`` if the optional SNMP module did not place it.
+        port: The switch interface name the device sits on, or ``None``.
     """
 
     ip: str
@@ -155,6 +161,8 @@ class HostResult:
     vendor: Optional[str] = None
     hostname: Optional[str] = None
     device_type: str = "unknown"
+    switch: Optional[str] = None
+    port: Optional[str] = None
 
     @property
     def is_live(self) -> bool:
@@ -250,6 +258,32 @@ def parse_ports(value: str) -> tuple[int, ...]:
     if not ports:
         raise argparse.ArgumentTypeError("no valid ports provided")
     return tuple(ports)
+
+
+def parse_switch_list(value: str) -> tuple[str, ...]:
+    """Parse a comma-separated list of switch IPs, for use as an ``argparse`` type.
+
+    Args:
+        value: A string such as ``"10.0.0.2,10.0.0.3"``.
+
+    Returns:
+        A tuple of validated IP-address strings in the order given.
+
+    Raises:
+        argparse.ArgumentTypeError: If any entry is not a valid IP address, or
+            if no address is supplied.
+    """
+    switches: list[str] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not _is_ip_address(part):
+            raise argparse.ArgumentTypeError(f"invalid switch IP {part!r}")
+        switches.append(part)
+    if not switches:
+        raise argparse.ArgumentTypeError("no valid switch IPs provided")
+    return tuple(switches)
 
 
 def positive_float(value: str) -> float:
@@ -757,6 +791,584 @@ def enrich_hosts(
             future.result()
 
 
+# ---------------------------------------------------------------------------
+# Optional SNMP switch-port mapping module.
+#
+# This block queries managed switches over SNMP (pysnmp) to learn which
+# physical port each MAC address lives on, correlates that with the discovered
+# devices, and reads LLDP to find switch-to-switch uplinks. pysnmp is imported
+# lazily, so the rest of the tool runs without it. The whole block is skipped
+# unless --switches is given. Targets pysnmp 7.x (install: pip install pysnmp).
+# ---------------------------------------------------------------------------
+
+# Bridge-MIB and related OIDs (as dotted strings).
+OID_DOT1D_TPFDB_PORT = "1.3.6.1.2.1.17.4.3.1.2"        # MAC -> bridge port
+OID_DOT1Q_TPFDB_PORT = "1.3.6.1.2.1.17.7.1.2.2.1.2"    # Q-BRIDGE: vlan+MAC -> port
+OID_DOT1D_BASEPORT_IFINDEX = "1.3.6.1.2.1.17.1.4.1.2"  # bridge port -> ifIndex
+OID_IFNAME = "1.3.6.1.2.1.31.1.1.1.1"                  # ifIndex -> ifName
+OID_IFDESCR = "1.3.6.1.2.1.2.2.1.2"                    # ifIndex -> ifDescr
+OID_SYSNAME = "1.3.6.1.2.1.1.5.0"                      # scalar sysName.0
+OID_LLDP_REM_CHASSIS = "1.0.8802.1.1.2.1.4.1.1.5"      # LLDP remote chassis id
+OID_LLDP_REM_PORTID = "1.0.8802.1.1.2.1.4.1.1.7"       # LLDP remote port id
+OID_LLDP_REM_SYSNAME = "1.0.8802.1.1.2.1.4.1.1.9"      # LLDP remote system name
+
+# Default SNMP timing.
+SNMP_TIMEOUT: float = 2.0
+SNMP_RETRIES: int = 1
+
+# Lazily imported pysnmp async hlapi module, cached after first load.
+_PYSNMP = None
+
+
+class SnmpUnavailable(Exception):
+    """Raised when the pysnmp library cannot be imported."""
+
+
+class SnmpError(Exception):
+    """Raised when an SNMP exchange with a switch fails."""
+
+
+@dataclass
+class LldpNeighbor:
+    """One LLDP neighbor seen by a switch.
+
+    Attributes:
+        local_port: The local LLDP port number the neighbor is seen on.
+        remote_sysname: The neighbor's advertised system name.
+        remote_port: The neighbor's advertised port id.
+        remote_chassis: The neighbor's advertised chassis id.
+    """
+
+    local_port: str
+    remote_sysname: str
+    remote_port: str
+    remote_chassis: str
+
+
+@dataclass
+class Switch:
+    """Result of querying one managed switch over SNMP.
+
+    Attributes:
+        ip: The switch management IP.
+        reachable: ``True`` if the switch answered SNMP.
+        sysname: The switch's SNMP sysName, if read.
+        mac_ports: Mapping of MAC address to the local interface name it is
+            learned on.
+        neighbors: LLDP neighbors the switch reports.
+        error: A short failure description when ``reachable`` is ``False``.
+    """
+
+    ip: str
+    reachable: bool = False
+    sysname: Optional[str] = None
+    mac_ports: dict[str, str] = field(default_factory=dict)
+    neighbors: list[LldpNeighbor] = field(default_factory=list)
+    error: Optional[str] = None
+
+
+@dataclass
+class UplinkLink:
+    """An LLDP link from one switch to a neighbor.
+
+    Attributes:
+        local_ip: The reporting switch's IP.
+        local_label: The reporting switch's name or IP.
+        local_port: The local port the neighbor is on.
+        remote_label: The neighbor's name or chassis id.
+        remote_port: The neighbor's port id.
+        is_switch: ``True`` if the neighbor is one of the queried switches.
+    """
+
+    local_ip: str
+    local_label: str
+    local_port: str
+    remote_label: str
+    remote_port: str
+    is_switch: bool
+
+
+def _load_pysnmp():
+    """Import and cache the pysnmp async hlapi module.
+
+    Returns:
+        The imported module.
+
+    Raises:
+        SnmpUnavailable: If pysnmp is not installed.
+    """
+    global _PYSNMP
+    if _PYSNMP is None:
+        try:
+            import pysnmp.hlapi.v3arch.asyncio as module
+        except Exception as exc:  # ImportError and any transitive failure.
+            raise SnmpUnavailable(str(exc) or exc.__class__.__name__) from exc
+        _PYSNMP = module
+    return _PYSNMP
+
+
+def resolve_snmp_community() -> Optional[str]:
+    """Obtain the SNMP community string without ever hardcoding it.
+
+    Reads the ``SNMP_COMMUNITY`` environment variable first; if unset and the
+    session is interactive, prompts for it without echo. Returns ``None`` when
+    no value is available, so the caller can skip SNMP gracefully.
+
+    Returns:
+        The community string, or ``None``.
+    """
+    community = os.environ.get("SNMP_COMMUNITY")
+    if community:
+        return community
+    if sys.stdin is not None and sys.stdin.isatty():
+        try:
+            entered = getpass.getpass("SNMP community string: ")
+        except (EOFError, KeyboardInterrupt):
+            return None
+        return entered or None
+    return None
+
+
+def _oid_ints(name: object) -> tuple[int, ...]:
+    """Return an SNMP object name as a tuple of integer sub-identifiers."""
+    as_tuple = getattr(name, "asTuple", None)
+    if callable(as_tuple):
+        try:
+            return tuple(int(part) for part in as_tuple())
+        except (TypeError, ValueError):
+            pass
+    return tuple(int(part) for part in str(name).strip(".").split(".") if part)
+
+
+def _mac_from_oid_tail(oid_tuple: Sequence[int]) -> Optional[str]:
+    """Build a MAC string from the last six sub-identifiers of a table index."""
+    if len(oid_tuple) < 6:
+        return None
+    tail = oid_tuple[-6:]
+    if any(octet < 0 or octet > 255 for octet in tail):
+        return None
+    return ":".join(f"{octet:02x}" for octet in tail)
+
+
+def _parse_fdb_port(varbinds: Sequence[tuple[Sequence[int], object]]) -> dict[str, int]:
+    """Parse a forwarding-table walk into a MAC-to-bridge-port mapping.
+
+    Args:
+        varbinds: ``(oid_tuple, value)`` pairs from a dot1dTpFdbPort or
+            dot1qTpFdbPort walk. The MAC is the last six sub-identifiers of the
+            index and the value is the bridge port number.
+
+    Returns:
+        A mapping of MAC address to bridge port number.
+    """
+    table: dict[str, int] = {}
+    for oid_tuple, value in varbinds:
+        mac = _mac_from_oid_tail(oid_tuple)
+        if mac is None:
+            continue
+        try:
+            table[mac] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return table
+
+
+def _parse_indexed_int(
+    varbinds: Sequence[tuple[Sequence[int], object]]
+) -> dict[int, int]:
+    """Parse a walk whose index's last sub-id is an int key and value is an int."""
+    table: dict[int, int] = {}
+    for oid_tuple, value in varbinds:
+        if not oid_tuple:
+            continue
+        try:
+            table[oid_tuple[-1]] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return table
+
+
+def _parse_indexed_str(
+    varbinds: Sequence[tuple[Sequence[int], object]]
+) -> dict[int, str]:
+    """Parse a walk whose index's last sub-id is an int key and value is a str."""
+    table: dict[int, str] = {}
+    for oid_tuple, value in varbinds:
+        if not oid_tuple:
+            continue
+        table[oid_tuple[-1]] = str(value)
+    return table
+
+
+def _compose_mac_ports(
+    fdb_port: dict[str, int],
+    base_port_ifindex: dict[int, int],
+    if_names: dict[int, str],
+) -> dict[str, str]:
+    """Resolve MAC-to-bridge-port into MAC-to-interface-name.
+
+    The forwarding table gives bridge port numbers, which map through
+    dot1dBasePortIfIndex to ifIndex, which map through ifName/ifDescr to a
+    human name. When a step is missing, falls back to the numeric port.
+
+    Args:
+        fdb_port: MAC to bridge port number.
+        base_port_ifindex: Bridge port number to ifIndex.
+        if_names: ifIndex to interface name.
+
+    Returns:
+        A mapping of MAC address to interface name.
+    """
+    mac_ports: dict[str, str] = {}
+    for mac, bridge_port in fdb_port.items():
+        if_index = base_port_ifindex.get(bridge_port, bridge_port)
+        mac_ports[mac] = if_names.get(if_index) or f"port {bridge_port}"
+    return mac_ports
+
+
+def _parse_lldp(
+    sysname_vbs: Sequence[tuple[Sequence[int], object]],
+    portid_vbs: Sequence[tuple[Sequence[int], object]],
+    chassis_vbs: Sequence[tuple[Sequence[int], object]],
+) -> list[LldpNeighbor]:
+    """Join the three LLDP remote-table walks into neighbor records.
+
+    Each lldpRemTable row is indexed by ``timeMark.localPortNum.remIndex``
+    appended to the column OID, so entries are joined on
+    ``(localPortNum, remIndex)``.
+
+    Args:
+        sysname_vbs: lldpRemSysName walk.
+        portid_vbs: lldpRemPortId walk.
+        chassis_vbs: lldpRemChassisId walk.
+
+    Returns:
+        The LLDP neighbors, one per remote-table row.
+    """
+
+    def by_index(
+        varbinds: Sequence[tuple[Sequence[int], object]], base_oid: str
+    ) -> dict[tuple[int, int], str]:
+        base_len = len([part for part in base_oid.split(".") if part])
+        mapping: dict[tuple[int, int], str] = {}
+        for oid_tuple, value in varbinds:
+            suffix = tuple(oid_tuple[base_len:])
+            if len(suffix) >= 3:
+                mapping[(suffix[1], suffix[2])] = str(value)
+        return mapping
+
+    sysnames = by_index(sysname_vbs, OID_LLDP_REM_SYSNAME)
+    ports = by_index(portid_vbs, OID_LLDP_REM_PORTID)
+    chassis = by_index(chassis_vbs, OID_LLDP_REM_CHASSIS)
+
+    neighbors: list[LldpNeighbor] = []
+    for key in sorted(set(sysnames) | set(ports) | set(chassis)):
+        neighbors.append(
+            LldpNeighbor(
+                local_port=str(key[0]),
+                remote_sysname=sysnames.get(key, ""),
+                remote_port=ports.get(key, ""),
+                remote_chassis=chassis.get(key, ""),
+            )
+        )
+    return neighbors
+
+
+async def _snmp_get(engine, module, community: str, ip: str, oid: str,
+                    timeout: float, retries: int) -> Optional[object]:
+    """Perform an SNMP GET of a single scalar OID.
+
+    Returns:
+        The value, or ``None`` if the agent had no such object.
+
+    Raises:
+        SnmpError: If the exchange failed (for example a timeout).
+    """
+    target = await module.UdpTransportTarget.create(
+        (ip, 161), timeout=timeout, retries=retries
+    )
+    error_indication, error_status, _error_index, var_binds = await module.get_cmd(
+        engine,
+        module.CommunityData(community, mpModel=1),
+        target,
+        module.ContextData(),
+        module.ObjectType(module.ObjectIdentity(oid)),
+    )
+    if error_indication:
+        raise SnmpError(str(error_indication))
+    if error_status:
+        raise SnmpError(error_status.prettyPrint())
+    if not var_binds:
+        return None
+    value = var_binds[0][1]
+    if isinstance(
+        value,
+        (module.NoSuchObject, module.NoSuchInstance, module.EndOfMibView, module.Null),
+    ):
+        return None
+    return value
+
+
+async def _snmp_walk(engine, module, community: str, ip: str, base_oid: str,
+                     timeout: float, retries: int
+                     ) -> list[tuple[tuple[int, ...], object]]:
+    """Walk an SNMP subtree and return coerced ``(oid_tuple, value)`` pairs.
+
+    Integer-typed values become ``int``; everything else becomes its pretty
+    string. End-of-MIB sentinels are skipped.
+
+    Raises:
+        SnmpError: If the exchange failed.
+    """
+    int_types = (
+        module.Integer32, module.Gauge32, module.Counter32,
+        module.Counter64, module.Unsigned32, module.TimeTicks,
+    )
+    target = await module.UdpTransportTarget.create(
+        (ip, 161), timeout=timeout, retries=retries
+    )
+    out: list[tuple[tuple[int, ...], object]] = []
+    walk = module.walk_cmd(
+        engine,
+        module.CommunityData(community, mpModel=1),
+        target,
+        module.ContextData(),
+        module.ObjectType(module.ObjectIdentity(base_oid)),
+        lexicographicMode=False,
+    )
+    async for error_indication, error_status, error_index, var_binds in walk:
+        if error_indication:
+            raise SnmpError(str(error_indication))
+        if error_status:
+            raise SnmpError(f"{error_status.prettyPrint()} at {error_index}")
+        for var_bind in var_binds:
+            value = var_bind[1]
+            if isinstance(
+                value,
+                (module.NoSuchObject, module.NoSuchInstance,
+                 module.EndOfMibView, module.Null),
+            ):
+                continue
+            coerced: object = int(value) if isinstance(value, int_types) else value.prettyPrint()
+            out.append((_oid_ints(var_bind[0]), coerced))
+    return out
+
+
+async def _query_switch(engine, module, ip: str, community: str,
+                        timeout: float, retries: int) -> Switch:
+    """Query one switch for its forwarding table and LLDP neighbors.
+
+    Any failure marks the switch unreachable rather than raising, so one dead
+    switch never aborts the run.
+    """
+    switch = Switch(ip=ip)
+    try:
+        # sysName.0 is universal; failing it means the switch did not answer.
+        sysname = await _snmp_get(
+            engine, module, community, ip, OID_SYSNAME, timeout, retries
+        )
+        switch.sysname = str(sysname) if sysname is not None else None
+
+        base_port_ifindex = _parse_indexed_int(
+            await _snmp_walk(engine, module, community, ip,
+                             OID_DOT1D_BASEPORT_IFINDEX, timeout, retries)
+        )
+        if_names = _parse_indexed_str(
+            await _snmp_walk(engine, module, community, ip,
+                             OID_IFNAME, timeout, retries)
+        )
+        if not if_names:
+            if_names = _parse_indexed_str(
+                await _snmp_walk(engine, module, community, ip,
+                                 OID_IFDESCR, timeout, retries)
+            )
+        fdb = _parse_fdb_port(
+            await _snmp_walk(engine, module, community, ip,
+                             OID_DOT1D_TPFDB_PORT, timeout, retries)
+        )
+        if not fdb:
+            # Many modern switches only populate the VLAN-aware Q-BRIDGE table.
+            fdb = _parse_fdb_port(
+                await _snmp_walk(engine, module, community, ip,
+                                 OID_DOT1Q_TPFDB_PORT, timeout, retries)
+            )
+        switch.mac_ports = _compose_mac_ports(fdb, base_port_ifindex, if_names)
+
+        try:
+            switch.neighbors = _parse_lldp(
+                await _snmp_walk(engine, module, community, ip,
+                                 OID_LLDP_REM_SYSNAME, timeout, retries),
+                await _snmp_walk(engine, module, community, ip,
+                                 OID_LLDP_REM_PORTID, timeout, retries),
+                await _snmp_walk(engine, module, community, ip,
+                                 OID_LLDP_REM_CHASSIS, timeout, retries),
+            )
+        except SnmpError:
+            switch.neighbors = []  # LLDP is optional; keep the FDB data.
+
+        switch.reachable = True
+    except Exception as exc:  # Degrade gracefully for this switch.
+        switch.reachable = False
+        switch.error = str(exc) or exc.__class__.__name__
+    return switch
+
+
+async def _query_all_switches(switch_ips: Sequence[str], community: str,
+                              timeout: float, retries: int) -> list[Switch]:
+    """Query every switch concurrently and return the results in input order."""
+    module = _load_pysnmp()
+    engine = module.SnmpEngine()
+    tasks = [
+        _query_switch(engine, module, ip, community, timeout, retries)
+        for ip in switch_ips
+    ]
+    return list(await asyncio.gather(*tasks))
+
+
+def run_snmp_module(switch_ips: Sequence[str], community: str,
+                    timeout: float = SNMP_TIMEOUT,
+                    retries: int = SNMP_RETRIES) -> list[Switch]:
+    """Synchronous entry point for the SNMP module.
+
+    Args:
+        switch_ips: The managed switch IPs to query.
+        community: The SNMP community string.
+        timeout: Per-request timeout in seconds.
+        retries: Per-request retry count.
+
+    Returns:
+        One :class:`Switch` per IP.
+
+    Raises:
+        SnmpUnavailable: If pysnmp is not installed.
+    """
+    _load_pysnmp()  # Fail fast with a clear error if pysnmp is missing.
+    return asyncio.run(
+        _query_all_switches(switch_ips, community, timeout, retries)
+    )
+
+
+def build_mac_port_map(switches: Sequence[Switch]) -> dict[str, tuple[str, str]]:
+    """Merge switch forwarding tables into a MAC-to-(switch, port) map.
+
+    When a MAC is seen on several ports (its access port plus every uplink it
+    is flooded across), the port carrying the fewest MACs wins. An access port
+    typically shows a single MAC, while a trunk or uplink shows many, so this
+    picks the edge port the device actually plugs into.
+
+    Args:
+        switches: The queried switches.
+
+    Returns:
+        A mapping of MAC address to ``(switch_ip, interface_name)``.
+    """
+    port_mac_counts: dict[tuple[str, str], int] = {}
+    for switch in switches:
+        if not switch.reachable:
+            continue
+        for port in switch.mac_ports.values():
+            port_mac_counts[(switch.ip, port)] = (
+                port_mac_counts.get((switch.ip, port), 0) + 1
+            )
+
+    best: dict[str, tuple[str, str, int]] = {}
+    for switch in switches:
+        if not switch.reachable:
+            continue
+        for mac, port in switch.mac_ports.items():
+            count = port_mac_counts[(switch.ip, port)]
+            current = best.get(mac)
+            if current is None or count < current[2]:
+                best[mac] = (switch.ip, port, count)
+    return {mac: (ip, port) for mac, (ip, port, _count) in best.items()}
+
+
+def correlate_devices(
+    results: Sequence[HostResult], mac_port_map: dict[str, tuple[str, str]]
+) -> None:
+    """Annotate discovered devices with the switch and port they sit on.
+
+    Args:
+        results: The host results to annotate in place.
+        mac_port_map: Output of :func:`build_mac_port_map`.
+    """
+    for host in results:
+        if host.is_live and host.mac and host.mac in mac_port_map:
+            host.switch, host.port = mac_port_map[host.mac]
+
+
+def switch_uplinks(switches: Sequence[Switch]) -> list[UplinkLink]:
+    """Derive LLDP links, flagging those that reach another queried switch.
+
+    Args:
+        switches: The queried switches.
+
+    Returns:
+        One :class:`UplinkLink` per LLDP neighbor seen on a reachable switch.
+    """
+    known_sysnames = {
+        switch.sysname for switch in switches if switch.sysname
+    }
+    links: list[UplinkLink] = []
+    for switch in switches:
+        if not switch.reachable:
+            continue
+        for neighbor in switch.neighbors:
+            remote_label = (
+                neighbor.remote_sysname or neighbor.remote_chassis or "unknown"
+            )
+            links.append(
+                UplinkLink(
+                    local_ip=switch.ip,
+                    local_label=switch.sysname or switch.ip,
+                    local_port=neighbor.local_port,
+                    remote_label=remote_label,
+                    remote_port=neighbor.remote_port,
+                    is_switch=bool(neighbor.remote_sysname)
+                    and neighbor.remote_sysname in known_sysnames,
+                )
+            )
+    return links
+
+
+def print_snmp_summary(switches: Sequence[Switch]) -> None:
+    """Print per-switch SNMP status and the discovered LLDP uplinks."""
+    print("SNMP switch-port mapping")
+    for switch in switches:
+        if switch.reachable:
+            label = switch.sysname or switch.ip
+            print(
+                f"  {switch.ip}  {label}  reachable  "
+                f"({len(switch.mac_ports)} MAC entries, "
+                f"{len(switch.neighbors)} LLDP neighbors)"
+            )
+        else:
+            print(f"  {switch.ip}  unreachable ({switch.error or 'no response'})")
+
+    links = switch_uplinks(switches)
+    uplinks = [link for link in links if link.is_switch]
+    if uplinks:
+        print("  Switch-to-switch uplinks (LLDP):")
+        seen: set[tuple[str, str]] = set()
+        for link in uplinks:
+            key = tuple(sorted((link.local_label, link.remote_label)))
+            if key in seen:
+                continue
+            seen.add(key)
+            print(
+                f"    {link.local_label} {link.local_port}  <->  "
+                f"{link.remote_label} {link.remote_port}"
+            )
+    others = [link for link in links if not link.is_switch]
+    if others:
+        print("  Other LLDP neighbors:")
+        for link in others:
+            print(
+                f"    {link.local_label} {link.local_port}  ->  "
+                f"{link.remote_label} {link.remote_port}"
+            )
+
+
 def group_into_segments(
     results: Sequence[HostResult],
     network: IPNetwork,
@@ -845,12 +1457,13 @@ def format_tree(segments: Sequence[Segment]) -> str:
                 and host.ip == segment.gateway_device.ip
             )
             marker = "  [gateway]" if is_gateway else ""
+            switch_text = f"  @ {host.switch}:{host.port}" if host.switch else ""
             line = (
                 f"{child_prefix}{dev_branch}"
                 f"{host.ip.ljust(ip_width)}  "
                 f"{(host.hostname or '-').ljust(host_width)}  "
                 f"{(host.vendor or '-').ljust(vendor_width)}  "
-                f"{host.device_type}{marker}"
+                f"{host.device_type}{switch_text}{marker}"
             )
             lines.append(line)
     return "\n".join(lines)
@@ -879,7 +1492,7 @@ def _dot_label(host: HostResult, is_gateway: bool) -> str:
     return "\\n".join(_dot_escape(part) for part in parts)
 
 
-def build_dot(segments: Sequence[Segment]) -> str:
+def _build_dot_logical(segments: Sequence[Segment]) -> str:
     """Build a Graphviz DOT document for the segment model.
 
     Each segment becomes a cluster. Within a segment, devices connect to a hub:
@@ -968,29 +1581,177 @@ def build_dot(segments: Sequence[Segment]) -> str:
     return "\n".join(out) + "\n"
 
 
-def print_report(results: Sequence[HostResult], total: int) -> None:
+def build_dot(
+    segments: Sequence[Segment], switches: Optional[Sequence[Switch]] = None
+) -> str:
+    """Build a Graphviz DOT document for the network.
+
+    With reachable SNMP switch data, devices attach to their switch by port and
+    switch-to-switch LLDP uplinks are drawn (a physical map). Without it, the
+    logical gateway-based map is produced. Render with, for example,
+    ``dot -Tpng map.dot -o map.png``.
+
+    Args:
+        segments: The segments to render.
+        switches: Optional SNMP switch results; triggers the physical map.
+
+    Returns:
+        The DOT document as a string, ending with a newline.
+    """
+    if switches and any(getattr(switch, "reachable", False) for switch in switches):
+        return _build_dot_physical(segments, switches)
+    return _build_dot_logical(segments)
+
+
+def _build_dot_physical(
+    segments: Sequence[Segment], switches: Sequence[Switch]
+) -> str:
+    """Build a physical DOT map: devices to switch ports, plus LLDP uplinks."""
+    reachable = [switch for switch in switches if switch.reachable]
+    sysname_to_ip = {sw.sysname: sw.ip for sw in reachable if sw.sysname}
+
+    out: list[str] = []
+    out.append("graph network_map {")
+    out.append('  graph [rankdir=LR, fontname="Helvetica", fontsize=12];')
+    out.append(
+        '  node [fontname="Helvetica", fontsize=10, shape=box, '
+        'style="rounded,filled", fillcolor="#f5f5f5"];'
+    )
+    out.append('  edge [color="#888888"];')
+    out.append("")
+
+    if any(segment.gateway_device for segment in segments):
+        out.append(
+            '  "internet" [label="Internet", shape=ellipse, '
+            'style=filled, fillcolor="#dddddd"];'
+        )
+        out.append("")
+
+    for switch in reachable:
+        label = switch.ip
+        if switch.sysname:
+            label += "\\n" + switch.sysname
+        label += "\\n[switch]"
+        out.append(
+            f'  "sw_{switch.ip}" [label="{_dot_escape(label)}", '
+            'shape=box3d, style=filled, fillcolor="#ffe8b3"];'
+        )
+    out.append("")
+
+    for index, segment in enumerate(segments):
+        out.append(f"  subgraph cluster_{index} {{")
+        out.append(f'    label="{_dot_escape(segment.network)}";')
+        out.append("    style=rounded;")
+        out.append('    color="#4472c4";')
+        out.append('    fontname="Helvetica";')
+
+        members = list(segment.devices)
+        if (
+            segment.gateway_device is not None
+            and segment.gateway_device not in members
+        ):
+            members = members + [segment.gateway_device]
+
+        if not members:
+            out.append(
+                f'    "seg{index}_empty" '
+                '[label="(no live hosts)", shape=plaintext, style=""];'
+            )
+        for host in members:
+            is_gateway = (
+                segment.gateway_device is not None
+                and host.ip == segment.gateway_device.ip
+            )
+            shape = "box3d" if is_gateway else "box"
+            out.append(
+                f'    {_dot_node_id(host.ip)} '
+                f'[label="{_dot_label(host, is_gateway)}", shape={shape}];'
+            )
+
+        unmapped = [host for host in segment.devices if not host.switch]
+        if segment.gateway_device is None and unmapped:
+            out.append(
+                f'    "seg{index}_hub" '
+                f'[label="{_dot_escape(segment.network)}\\n(segment)", '
+                'shape=ellipse, style=filled, fillcolor="#dddddd"];'
+            )
+        out.append("  }")
+        out.append("")
+
+    for index, segment in enumerate(segments):
+        if segment.gateway_device is not None:
+            out.append(
+                f'  "internet" -- {_dot_node_id(segment.gateway_device.ip)};'
+            )
+            fallback: Optional[str] = _dot_node_id(segment.gateway_device.ip)
+        elif any(not host.switch for host in segment.devices):
+            fallback = f'"seg{index}_hub"'
+        else:
+            fallback = None
+
+        for host in segment.devices:
+            if host.switch:
+                out.append(
+                    "  "
+                    + _dot_node_id(host.ip)
+                    + ' -- "sw_'
+                    + host.switch
+                    + '" [label="'
+                    + _dot_escape(host.port or "")
+                    + '"];'
+                )
+            elif fallback is not None and not (
+                segment.gateway_device is not None
+                and host.ip == segment.gateway_device.ip
+            ):
+                out.append(f"  {fallback} -- {_dot_node_id(host.ip)};")
+
+    seen: set[tuple[str, str]] = set()
+    for switch in reachable:
+        for neighbor in switch.neighbors:
+            remote_ip = sysname_to_ip.get(neighbor.remote_sysname)
+            if remote_ip and remote_ip != switch.ip:
+                key = tuple(sorted((switch.ip, remote_ip)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                edge_label = _dot_escape(
+                    f"{neighbor.local_port}<->{neighbor.remote_port}"
+                )
+                out.append(
+                    f'  "sw_{switch.ip}" -- "sw_{remote_ip}" '
+                    f'[label="{edge_label}", style=bold, color="#d08400"];'
+                )
+
+    out.append("}")
+    return "\n".join(out) + "\n"
+
+
+def print_report(
+    results: Sequence[HostResult], total: int, show_switch_port: bool = False
+) -> None:
     """Print a table of the live hosts to standard output.
 
     Args:
         results: Every host result from the scan.
         total: How many hosts were scanned, for the summary line.
+        show_switch_port: Add SWITCH and PORT columns (set when SNMP ran).
     """
     live = [result for result in results if result.is_live]
     if not live:
         print(f"No live hosts found ({total} scanned).")
         return
 
-    headers = (
-        "IP ADDRESS",
-        "OPEN PORTS",
-        "PING",
-        "MAC ADDRESS",
-        "VENDOR",
-        "HOSTNAME",
-        "DEVICE TYPE",
-    )
-    rows = [
-        (
+    headers = [
+        "IP ADDRESS", "OPEN PORTS", "PING", "MAC ADDRESS",
+        "VENDOR", "HOSTNAME", "DEVICE TYPE",
+    ]
+    if show_switch_port:
+        headers += ["SWITCH", "PORT"]
+
+    rows: list[tuple[str, ...]] = []
+    for result in live:
+        row = [
             result.ip,
             ",".join(str(port) for port in result.open_ports) or "-",
             "yes" if result.pinged else "no",
@@ -998,9 +1759,11 @@ def print_report(results: Sequence[HostResult], total: int) -> None:
             result.vendor or "-",
             result.hostname or "-",
             result.device_type,
-        )
-        for result in live
-    ]
+        ]
+        if show_switch_port:
+            row += [result.switch or "-", result.port or "-"]
+        rows.append(tuple(row))
+
     widths = [
         max(len(headers[col]), *(len(row[col]) for row in rows))
         for col in range(len(headers))
@@ -1066,6 +1829,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="FILE",
         help="Write the network map as a Graphviz DOT file to FILE.",
     )
+    parser.add_argument(
+        "--switches",
+        type=parse_switch_list,
+        metavar="IP[,IP...]",
+        help=(
+            "Comma-separated managed switch IPs to query over SNMP for "
+            "switch-port mapping. Reads the community string from the "
+            "SNMP_COMMUNITY environment variable, or prompts for it. Requires "
+            "the pysnmp library; skipped gracefully if it is missing."
+        ),
+    )
     return parser
 
 
@@ -1095,12 +1869,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     gateway = detect_default_gateway()
     segments = group_into_segments(results, args.cidr, gateway, neighbors)
 
-    print_report(results, total)
+    # Optional SNMP switch-port mapping module.
+    switches: list[Switch] = []
+    snmp_ran = False
+    if args.switches:
+        community = resolve_snmp_community()
+        if community is None:
+            print(
+                "SNMP: no community string available (set SNMP_COMMUNITY or run "
+                "interactively); skipping switch-port mapping.",
+                file=sys.stderr,
+            )
+        else:
+            try:
+                switches = run_snmp_module(args.switches, community)
+                snmp_ran = True
+            except SnmpUnavailable as exc:
+                print(
+                    f"SNMP: pysnmp is not available ({exc}); skipping switch-port "
+                    "mapping. Install it with: pip install pysnmp",
+                    file=sys.stderr,
+                )
+        if snmp_ran:
+            correlate_devices(results, build_mac_port_map(switches))
+
+    print_report(results, total, show_switch_port=snmp_ran)
     print()
     print(format_tree(segments))
+    if snmp_ran:
+        print()
+        print_snmp_summary(switches)
 
     if args.map_file:
-        dot = build_dot(segments)
+        dot = build_dot(segments, switches if snmp_ran else None)
         try:
             with open(args.map_file, "w", encoding="utf-8") as handle:
                 handle.write(dot)
