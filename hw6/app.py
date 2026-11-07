@@ -24,21 +24,42 @@ Each live host is then enriched with:
 Finally, hosts are grouped by subnet and default gateway into segments. The
 result is printed as a table, printed again as an indented text tree, and can
 be exported as a Graphviz DOT file (``--map FILE``) for rendering as a network
-map. Only the Python standard library is used.
+map.
+
+Security and safety:
+
+* The tool is strictly read-only. It performs only TCP connect probes (each
+  socket is closed at once), one ICMP echo per host, and SNMP GET / GETNEXT
+  reads. It issues no SNMP SET and writes nothing to any scanned device.
+* ``--authorized`` is required; the tool refuses to run without that explicit
+  confirmation that you are permitted to scan the target.
+* Every input is validated (CIDR, ports, switch IPs) and nothing user-supplied
+  reaches a shell (no ``shell=True``; all subprocess calls take argument lists).
+* The SNMP community string is read only from the ``SNMP_COMMUNITY`` environment
+  variable (or a no-echo prompt). It is never hardcoded, stored, or logged.
+* All actions are logged to a timestamped file, and scan concurrency and rate
+  are capped.
+
+The core tool uses only the Python standard library; the optional SNMP module
+uses pysnmp.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime
 import getpass
 import ipaddress
+import logging
 import os
 import platform
 import re
 import socket
 import subprocess
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence, Union
@@ -56,6 +77,45 @@ DEFAULT_TIMEOUT: float = 1.0
 
 # Default size of the worker thread pool.
 DEFAULT_WORKERS: int = 100
+
+# Hard ceiling on concurrent probe threads, regardless of --workers.
+MAX_WORKERS: int = 256
+
+# Default probe start-rate cap, in hosts per second.
+DEFAULT_RATE: float = 100.0
+
+# Maximum switches queried concurrently over SNMP.
+MAX_SNMP_CONCURRENCY: int = 8
+
+# Module logger; handlers are attached by setup_logging().
+log = logging.getLogger("netdiscover")
+
+
+class RateLimiter:
+    """Thread-safe cap on how often an action may start.
+
+    Each :meth:`acquire` reserves the next evenly spaced time slot and sleeps
+    until it arrives, so concurrent worker threads together begin at most
+    ``rate`` actions per second. A non-positive rate disables throttling.
+    """
+
+    def __init__(self, rate_per_second: float) -> None:
+        self._interval = 1.0 / rate_per_second if rate_per_second > 0 else 0.0
+        self._lock = threading.Lock()
+        self._next = 0.0
+
+    def acquire(self) -> None:
+        """Block until this caller's rate slot is due."""
+        if self._interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next)
+            self._next = slot + self._interval
+        delay = slot - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+
 
 # OUI (Organizationally Unique Identifier) to vendor lookup.
 #
@@ -365,6 +425,12 @@ def ping_host(host: str, timeout: float) -> bool:
     Returns:
         ``True`` if ``ping`` reported success (exit code 0), else ``False``.
     """
+    # Defense in depth: never hand anything but a validated IP to the shell-less
+    # subprocess call below. Callers already pass addresses from the scanned
+    # network, so this only guards against future misuse.
+    if not _is_ip_address(host):
+        return False
+
     system = platform.system().lower()
     if system == "windows":
         # -n 1: one echo request. -w: per-reply timeout in milliseconds.
@@ -411,24 +477,35 @@ def discover(
     ports: Sequence[int],
     timeout: float,
     workers: int,
+    limiter: Optional[RateLimiter] = None,
 ) -> list[HostResult]:
     """Probe every usable host in a network concurrently.
+
+    Concurrency is bounded by ``workers``, the host count, and the hard
+    :data:`MAX_WORKERS` ceiling. When a limiter is given, probe starts are also
+    rate-capped.
 
     Args:
         network: The validated target network.
         ports: The TCP ports to probe on each host.
         timeout: Per-probe timeout in seconds.
-        workers: Maximum number of worker threads.
+        workers: Requested worker-thread count (capped at :data:`MAX_WORKERS`).
+        limiter: Optional per-host start-rate limiter.
 
     Returns:
         One :class:`HostResult` per host, sorted by ascending IP address.
     """
     hosts = [str(host) for host in network.hosts()]
+    worker_count = max(1, min(workers, MAX_WORKERS, len(hosts)))
+
+    def run_one(host: str) -> HostResult:
+        if limiter is not None:
+            limiter.acquire()
+        return probe_host(host, ports, timeout)
+
     results: list[HostResult] = []
-    with ThreadPoolExecutor(max_workers=min(workers, len(hosts))) as executor:
-        futures = [
-            executor.submit(probe_host, host, ports, timeout) for host in hosts
-        ]
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [executor.submit(run_one, host) for host in hosts]
         for future in as_completed(futures):
             results.append(future.result())
     results.sort(key=lambda result: ipaddress.ip_address(result.ip))
@@ -1215,14 +1292,16 @@ async def _query_switch(engine, module, ip: str, community: str,
 
 async def _query_all_switches(switch_ips: Sequence[str], community: str,
                               timeout: float, retries: int) -> list[Switch]:
-    """Query every switch concurrently and return the results in input order."""
+    """Query switches concurrently, capped at :data:`MAX_SNMP_CONCURRENCY`."""
     module = _load_pysnmp()
     engine = module.SnmpEngine()
-    tasks = [
-        _query_switch(engine, module, ip, community, timeout, retries)
-        for ip in switch_ips
-    ]
-    return list(await asyncio.gather(*tasks))
+    semaphore = asyncio.Semaphore(MAX_SNMP_CONCURRENCY)
+
+    async def guarded(ip: str) -> Switch:
+        async with semaphore:
+            return await _query_switch(engine, module, ip, community, timeout, retries)
+
+    return list(await asyncio.gather(*(guarded(ip) for ip in switch_ips)))
 
 
 def run_snmp_module(switch_ips: Sequence[str], community: str,
@@ -1821,7 +1900,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--workers",
         type=positive_int,
         default=DEFAULT_WORKERS,
-        help=f"Worker thread count (default: {DEFAULT_WORKERS}).",
+        help=(
+            f"Worker thread count (default: {DEFAULT_WORKERS}, hard-capped at "
+            f"{MAX_WORKERS})."
+        ),
     )
     parser.add_argument(
         "--map",
@@ -1840,7 +1922,69 @@ def build_parser() -> argparse.ArgumentParser:
             "the pysnmp library; skipped gracefully if it is missing."
         ),
     )
+    parser.add_argument(
+        "--authorized",
+        action="store_true",
+        help=(
+            "Confirm you are authorized to scan the target. REQUIRED: the tool "
+            "refuses to run without it. Only scan networks you own or have "
+            "explicit written permission to test."
+        ),
+    )
+    parser.add_argument(
+        "--rate",
+        type=positive_float,
+        default=DEFAULT_RATE,
+        metavar="N",
+        help=(
+            "Cap probe starts to N hosts per second "
+            f"(default: {DEFAULT_RATE})."
+        ),
+    )
+    parser.add_argument(
+        "--log",
+        dest="log_path",
+        metavar="FILE",
+        help=(
+            "Log file path (default: a timestamped netdiscover-*.log in the "
+            "current directory). The SNMP community string is never logged."
+        ),
+    )
     return parser
+
+
+def setup_logging(log_path: Optional[str]) -> tuple[logging.Logger, Optional[str]]:
+    """Attach a file handler to the module logger, using a timestamped file.
+
+    Args:
+        log_path: Explicit log path, or ``None`` for a timestamped default in
+            the current directory.
+
+    Returns:
+        The configured logger and the path actually opened (``None`` if no file
+        could be created, in which case logging is silently dropped and the
+        scan still runs).
+    """
+    if not log_path:
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_path = f"netdiscover-{stamp}.log"
+
+    log.setLevel(logging.INFO)
+    for handler in list(log.handlers):
+        log.removeHandler(handler)
+
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S%z"
+    )
+    try:
+        handler: logging.Handler = logging.FileHandler(log_path, encoding="utf-8")
+    except OSError as exc:
+        print(f"warning: cannot open log file {log_path!r}: {exc}", file=sys.stderr)
+        log.addHandler(logging.NullHandler())
+        return log, None
+    handler.setFormatter(formatter)
+    log.addHandler(handler)
+    return log, log_path
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1850,68 +1994,130 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         argv: Argument list to parse. Defaults to ``sys.argv[1:]``.
 
     Returns:
-        A process exit code: 0 on success, 1 if the map file could not be
-        written.
+        A process exit code: 0 on success, 1 on an error, 2 if the run is not
+        authorized.
     """
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    logger, log_path = setup_logging(args.log_path)
+
+    # Authorization gate: refuse before any network activity happens.
+    if not args.authorized:
+        logger.warning("Refused: run attempted without --authorized (target=%s)", args.cidr)
+        print(
+            "Refusing to run without --authorized.\n"
+            "Only scan networks you own or have explicit written permission to "
+            "scan. Re-run with --authorized to confirm you are permitted.",
+            file=sys.stderr,
+        )
+        return 2
+
     total = len(list(args.cidr.hosts()))
     ports_text = ",".join(str(port) for port in args.ports)
+    workers = max(1, min(args.workers, MAX_WORKERS))
+
+    logger.info(
+        "Authorized scan start: target=%s ports=%s workers=%d rate=%.1f/s switches=%s",
+        args.cidr, ports_text, workers, args.rate,
+        ",".join(args.switches) if args.switches else "none",
+    )
+    if log_path:
+        print(f"Logging actions to {log_path}", file=sys.stderr)
     print(
         f"Scanning {args.cidr} ({total} hosts) on ports {ports_text} ...",
         file=sys.stderr,
     )
 
-    results = discover(args.cidr, args.ports, args.timeout, args.workers)
-    neighbors = read_neighbor_table()
-    enrich_hosts(results, neighbors, args.workers)
-    gateway = detect_default_gateway()
-    segments = group_into_segments(results, args.cidr, gateway, neighbors)
+    try:
+        limiter = RateLimiter(args.rate)
+        results = discover(args.cidr, args.ports, args.timeout, workers, limiter)
+        live_count = sum(1 for result in results if result.is_live)
+        logger.info("Discovery complete: %d live of %d scanned", live_count, total)
 
-    # Optional SNMP switch-port mapping module.
-    switches: list[Switch] = []
-    snmp_ran = False
-    if args.switches:
-        community = resolve_snmp_community()
-        if community is None:
-            print(
-                "SNMP: no community string available (set SNMP_COMMUNITY or run "
-                "interactively); skipping switch-port mapping.",
-                file=sys.stderr,
-            )
-        else:
-            try:
-                switches = run_snmp_module(args.switches, community)
-                snmp_ran = True
-            except SnmpUnavailable as exc:
+        neighbors = read_neighbor_table()
+        enrich_hosts(results, neighbors, workers)
+        gateway = detect_default_gateway()
+        logger.info("Default gateway: %s", gateway or "unknown")
+        segments = group_into_segments(results, args.cidr, gateway, neighbors)
+
+        # Optional SNMP switch-port mapping module.
+        switches: list[Switch] = []
+        snmp_ran = False
+        if args.switches:
+            community = resolve_snmp_community()
+            if community is None:
+                logger.warning("SNMP skipped: no community string available")
                 print(
-                    f"SNMP: pysnmp is not available ({exc}); skipping switch-port "
-                    "mapping. Install it with: pip install pysnmp",
+                    "SNMP: no community string available (set SNMP_COMMUNITY or "
+                    "run interactively); skipping switch-port mapping.",
                     file=sys.stderr,
                 )
+            else:
+                # Log only the source of the community, never the value.
+                source = (
+                    "SNMP_COMMUNITY env var"
+                    if os.environ.get("SNMP_COMMUNITY")
+                    else "interactive prompt"
+                )
+                logger.info(
+                    "SNMP: community loaded from %s; querying %d switch(es)",
+                    source, len(args.switches),
+                )
+                try:
+                    switches = run_snmp_module(args.switches, community)
+                    snmp_ran = True
+                    for switch in switches:
+                        if switch.reachable:
+                            logger.info(
+                                "SNMP %s: reachable (%d MAC entries, %d LLDP neighbors)",
+                                switch.ip, len(switch.mac_ports), len(switch.neighbors),
+                            )
+                        else:
+                            logger.warning(
+                                "SNMP %s: unreachable (%s)",
+                                switch.ip, switch.error or "no response",
+                            )
+                except SnmpUnavailable as exc:
+                    logger.warning("SNMP skipped: pysnmp unavailable (%s)", exc)
+                    print(
+                        f"SNMP: pysnmp is not available ({exc}); skipping "
+                        "switch-port mapping. Install it with: pip install pysnmp",
+                        file=sys.stderr,
+                    )
+            if snmp_ran:
+                correlate_devices(results, build_mac_port_map(switches))
+
+        print_report(results, total, show_switch_port=snmp_ran)
+        print()
+        print(format_tree(segments))
         if snmp_ran:
-            correlate_devices(results, build_mac_port_map(switches))
+            print()
+            print_snmp_summary(switches)
 
-    print_report(results, total, show_switch_port=snmp_ran)
-    print()
-    print(format_tree(segments))
-    if snmp_ran:
-        print()
-        print_snmp_summary(switches)
+        if args.map_file:
+            dot = build_dot(segments, switches if snmp_ran else None)
+            try:
+                with open(args.map_file, "w", encoding="utf-8") as handle:
+                    handle.write(dot)
+            except OSError as exc:
+                logger.error("Map write failed (%s): %s", args.map_file, exc)
+                print(
+                    f"error: could not write map to {args.map_file}: {exc}",
+                    file=sys.stderr,
+                )
+                return 1
+            logger.info("Network map written: %s", args.map_file)
+            print()
+            print(f"Network map written to {args.map_file}")
+            print(f"Render it with: dot -Tpng {args.map_file} -o network_map.png")
 
-    if args.map_file:
-        dot = build_dot(segments, switches if snmp_ran else None)
-        try:
-            with open(args.map_file, "w", encoding="utf-8") as handle:
-                handle.write(dot)
-        except OSError as exc:
-            print(f"error: could not write map to {args.map_file}: {exc}", file=sys.stderr)
-            return 1
-        print()
-        print(f"Network map written to {args.map_file}")
-        print(f"Render it with: dot -Tpng {args.map_file} -o network_map.png")
-    return 0
+        logger.info("Scan complete")
+        return 0
+    except Exception as exc:  # Graceful catch-all: log, report, no traceback.
+        logger.exception("Unexpected error during scan")
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
