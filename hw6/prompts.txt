@@ -1,0 +1,213 @@
+Promt 1: C:\Users\wyatt\OneDrive\Documents\GitHub\COT4930\hw6
+
+Create a Python CLI network discovery tool in app.py however only use the path above, ignoring the prompts.txt and screencast_url.txt. It takes a target CIDR via argparse and strictly validates it (reject malformed input, cap at 1024 hosts). Discover live hosts by doing a TCP connect probe on a small set of common ports (22,80,443,445,3389) with a thread pool and per-connection timeouts, and also by sending one system ping per host (via subprocess) to populate the ARP/neighbor cache. Output a table of live hosts. Full type hints and docstrings. Standard library only for this step.
+Answer 1: 
+I'll build the tool, test it locally, then write it to your `hw6` folder. Starting now.
+
+File's written and the device tools are loaded. Let me test it locally before sending it over.
+
+Validation works. Now a functional test: I'll open a listener on a port and confirm the TCP probe detects it.
+
+Works as intended. The TCP probe found the open port and marked the host live. Ping shows "no" only because this sandbox can't send ICMP. On your Windows machine you'll get real ping results and the ARP cache gets populated.
+
+Now I'll put `app.py` in your `hw6` folder. That folder isn't connected yet, so I need your approval for access.
+
+Access granted. Writing the file now.
+
+Done. `app.py` is now in `C:\Users\wyatt\OneDrive\Documents\GitHub\COT4930\hw6`. I didn't touch `prompts.txt` or `screencast_url.txt`.
+
+What it does, matching each requirement:
+
+**Input validation.** `argparse` with a custom `parse_cidr` type. It rejects anything `ipaddress` won't parse, masks host bits so `192.168.1.37/24` works, rejects networks with zero usable hosts, and caps at 1024 usable hosts. A size guard runs before building the host list, so a bare IPv6 /64 gets rejected instantly instead of trying to allocate. Ports, timeout, and worker count have their own validators too. Bad input exits with code 2 and a clear message.
+
+**TCP probe.** `socket.create_connection` against 22, 80, 443, 445, 3389, stopping at the first open port. Per-connection timeout, run across a `ThreadPoolExecutor`.
+
+**Ping.** One echo per host via `subprocess`, with OS-specific flags (`-n`/`-w` on Windows, `-c`/`-W` on Linux and macOS). This populates the ARP/neighbor cache like you asked. A missing or hung `ping` returns False instead of crashing.
+
+**Liveness.** A host counts as live if a port opened or the ping replied. Output is a sorted table of live hosts with the open port and ping result, plus a summary line. The scan status prints to stderr so it stays out of the table on stdout.
+
+Full type hints and docstrings throughout, standard library only.
+
+Run it like this:
+
+```
+python app.py 192.168.1.0/24
+python app.py 10.0.0.0/28 -t 0.5 -w 64
+python app.py 192.168.1.0/24 -p 22,3389
+```
+
+One note from testing: a dead host walks all five ports before the ping, so with the default 1-second timeout each unresponsive host can take about 5 seconds of TCP wait. The thread pool hides most of that across a /24, but if a step later asks for speed, dropping the timeout or probing ports concurrently is the lever.
+Promt 2:
+
+For each live host, enrich it with: its MAC address read from the local neighbor table (parse the output of `ip neigh`), the hardware vendor resolved from the MAC's OUI prefix (bundle a small built-in OUI-to-vendor lookup, with a note on how to extend it), the hostname via reverse DNS, and a best-guess device type (computer, phone, printer, TV/IoT, server) inferred from open ports and vendor. Add these columns to the output table.
+Answer 2:
+Good enrichment to add. One wrinkle worth flagging up front: `ip neigh` is Linux-only, and your dev machine is Windows. I'll parse `ip neigh` as the primary path like you asked, and fall back to `arp -a` so the MAC lookup actually works when you run it on Windows (and on macOS). Let me rewrite `app.py` with the four new columns.
+
+Now let me test it, including the parsers and inference logic with synthetic data since this sandbox has no real LAN neighbors.
+
+Functional run works. The new columns render, reverse DNS resolved `localhost`, and MAC is blank since loopback has no ARP entry. The unit-test block failed only because isolated mode dropped the current directory from the path. Rerunning normally (this is your own project code, not untrusted input).
+
+All green. Writing the updated file to your `hw6` folder.
+
+Done. The updated `app.py` is in your `hw6` folder with four new columns. The table is now: `IP ADDRESS`, `OPEN PORTS`, `PING`, `MAC ADDRESS`, `VENDOR`, `HOSTNAME`, `DEVICE TYPE`.
+
+How each enrichment works:
+
+**MAC address.** After the ping sweep seeds the cache, `read_neighbor_table()` runs `ip neigh` first and parses it as you asked. On Windows and macOS, where `ip` doesn't exist, it falls back to `arp -a`. The parser handles all three formats: `ip neigh` lladdr lines, Windows dash-separated MACs, and the short BSD/macOS style like `0:c:29:...`. Everything normalizes to lowercase colon form.
+
+**Vendor.** `OUI_VENDORS` is a built-in table of about 50 real prefixes covering Apple, Raspberry Pi, Espressif, Samsung, Google, Nest, Amazon, Roku, HP, Canon, Brother, Cisco, VMware, Dell, Intel, Ubiquiti and more. Keys are the 24-bit OUI as six hex characters. The extend note sits right above the table: add entries by hand, or load the full IEEE registry from `oui.csv` into the same dict and the lookup code doesn't change.
+
+**Hostname.** `socket.gethostbyaddr` for a reverse PTR lookup, returning `None` when nothing resolves.
+
+**Device type.** `guess_device_type()` reads open ports and vendor and returns computer, phone, printer, TV/IoT, server, or unknown. Priority runs strongest signal first: printer and VM vendors, then SMB/RDP for computers, SSH for servers, consumer brands for TV/IoT, web-only for appliances, and a ping-only Apple device as a phone guess.
+
+Two design notes worth your attention:
+
+I changed the TCP probe to return every open port instead of stopping at the first. Device typing needs that. A box with both 445 and 3389 reads as a computer, while 22 alone reads as a server, and you lose that if you stop early. That's why the column is now `OPEN PORTS`.
+
+The hard limit: MAC and vendor only resolve for hosts on your own subnet. ARP is layer 2, so anything past a router shows up with no MAC and no vendor, which also weakens the device-type guess for those hosts. And the typing is a heuristic, not a fingerprint. Five ports and a vendor prefix can't tell an iPhone from an iPad, so read that column as a hint.
+
+I verified the three neighbor-table formats, the vendor lookup, and eleven device-typing cases against synthetic data, since this sandbox has no real LAN to probe.
+Promt 3:
+
+Group discovered devices by subnet and default gateway to form network segments. Build an adjacency model of segments and their devices, and export it as a Graphviz DOT file so it can be rendered as a network map. Also print the grouping as an indented text tree. Add a --map FILE flag to write the DOT output.
+Answer 3: 
+Good next layer. This turns the flat host list into a segment model and a renderable map. I'll rewrite `app.py` to add segment grouping, default-gateway detection, the DOT export, the text tree, and the `--map` flag.
+
+Now let me test the new pieces: gateway parsers, the tree, the DOT output, and an end-to-end run with `--map`. I'll validate the DOT with Graphviz if it's installed.
+
+Graphviz is available, so let me validate the DOT actually renders, then run the full tool end to end with `--map`.
+
+All green. Graphviz renders both the gateway and no-gateway DOT variants, and the full pipeline works: table, tree, DOT file, render hint. Writing the updated file to your `hw6` folder.
+
+Done. The updated `app.py` is in your `hw6` folder. It now turns the host list into a segment model and exports a map.
+
+What I added:
+
+**Segment model.** A `Segment` dataclass holds the subnet, its gateway, the live devices in it, and a `gateway_device` node. `group_into_segments()` builds it. Since the tool scans one CIDR, you get one segment, but the function returns a list and both renderers walk N segments, so a future multi-subnet scan needs no rewrite.
+
+**Gateway detection.** `detect_default_gateway()` reads the routing table: `ip route` on Linux (parsed as you'd expect for `ip neigh`), `route print` on Windows, and `route -n get default` or `netstat -rn` on macOS. The gateway attaches to the segment only when it falls inside the scanned subnet. If the router ignored the probes and never showed up as a live host, I build and enrich a separate node for it, so the map still shows the router instead of dropping it.
+
+**Text tree.** Printed to stdout under the table. It reads like this:
+
+```
+network
+`-- 192.168.1.0/24  (gateway: 192.168.1.1)
+    |-- 192.168.1.1   router.local  Cisco         TV/IoT  [gateway]
+    |-- 192.168.1.10  wyatt-pc      Dell          computer
+    |-- 192.168.1.42  -             Raspberry Pi  server
+    `-- 192.168.1.77  -             Apple         phone
+```
+
+**DOT export.** `--map FILE` writes a Graphviz file. Each segment is a cluster. When a gateway exists, the edges run Internet to gateway to each device, and the gateway gets a `box3d` shape. When no gateway is known, a synthetic segment hub stands in. I validated both shapes with the real `dot` binary, and the tool prints the render command after writing:
+
+```
+python app.py 192.168.1.0/24 --map net.dot
+dot -Tpng net.dot -o network_map.png
+```
+
+One honest limit on the segmentation. One scan sees one subnet, so you get one segment. Grouping "by subnet and gateway" only splits into more segments if you feed devices from more than one subnet, and the gateway line is meaningful only when you're scanning your own local subnet, since you can't read a remote subnet's router from here.
+Promp 4: 
+
+Add an optional module that maps devices to physical switch ports using SNMP. Given a list of managed switch IPs and an SNMP community string (read from an environment variable or prompted, never hardcoded), query each switch's Bridge-MIB forwarding table (dot1dTpFdbPort) and interface names (ifName/ifDescr) to build a MAC-to-(switch, port) map, then correlate it with the discovered devices so each device shows the switch and port it's on. Also read LLDP neighbor data to identify switch-to-switch uplinks. Use the pysnmp library. Degrade gracefully if a switch is unreachable or SNMP is not configured.
+Answer 4:
+This step pulls in `pysnmp`, whose API has shifted a lot across versions. Before writing anything I'll install it in the sandbox and pin down the exact import surface, so the code matches what you'll actually install.
+
+pysnmp 7.1.31, the async-only line. Let me inspect its actual import surface so I target the right names.
+
+pysnmp 7.1.31 uses the async-only hlapi with snake_case calls (`walk_cmd`, `get_cmd`) and an awaitable `UdpTransportTarget.create`. I'll build the module against that and run it under `asyncio`, lazily imported so the base tool keeps working without pysnmp. Starting with the smaller structural edits.
+
+Now the SNMP module itself, inserted between enrichment and segment grouping.
+
+Now I'll rename the existing DOT builder to the logical one, add a physical-map builder plus a dispatcher, extend the table and tree, and wire the SNMP phase into `main`.
+
+Now compile and run the full test pass: pure SNMP parsing logic, correlation, the physical DOT (validated with Graphviz), and graceful degradation.
+
+SNMP logic is solid, including the access-port-over-trunk heuristic. Now the physical DOT render and the graceful-degradation paths.
+
+The physical map renders cleanly: switch nodes, device-to-port edges with labels, the unmapped host falling back to the gateway, and the bold switch-to-switch uplink. The tree shows the `@ switch:port` annotations. Now the two degradation paths.
+
+Test A passes: it skips cleanly and keeps going. Now the real async path against an unreachable switch.
+
+Test B confirms the real async pysnmp path: it attempted the switch, timed out, reported it unreachable, and carried on. Last degradation mode to verify is pysnmp being absent.
+
+All three degradation modes work: no community, unreachable switch, and missing library. Final regression check on the base tool and the new help.
+
+Base tool is unchanged without `--switches`, and the new flag is in the help. Committing the updated file to your `hw6` folder.
+
+Done. The updated `app.py` is in your `hw6` folder. The SNMP switch-port module is optional in every sense: it only runs with `--switches`, `pysnmp` is imported lazily so the base tool stays standard-library-only, and any failure degrades instead of crashing.
+
+How it works:
+
+**Community string.** `resolve_snmp_community()` reads `SNMP_COMMUNITY` from the environment, and if that's empty and the session is interactive, prompts with `getpass` (no echo). It's never a CLI argument and never hardcoded, so it won't leak into your shell history or the process list. No value means the module skips with a note.
+
+**Per switch.** For each IP, the code walks `dot1dBasePortIfIndex` (bridge port to ifIndex), `ifName` with an `ifDescr` fallback (ifIndex to name), and `dot1dTpFdbPort` (MAC to bridge port). If the Bridge-MIB table comes back empty, it falls back to the VLAN-aware `dot1qTpFdbPort`, since many modern switches only populate that one. It chains those into a MAC-to-interface map and reads `sysName` for a label.
+
+**Correlation.** `build_mac_port_map()` merges every switch's table. When a MAC shows up on several ports, it picks the port carrying the fewest MACs. That's the access port the device plugs into, not a trunk or uplink that sees dozens of MACs. Each discovered device then gets `switch` and `port` fields, which show up as two new table columns and as `@ switch:port` tags in the tree.
+
+**LLDP uplinks.** It walks `lldpRemSysName`, `lldpRemPortId`, and `lldpRemChassisId`, joins them on the local-port and remote-index parts of the table index, and flags a neighbor as a switch-to-switch uplink when its system name matches another switch you queried. Those print in an SNMP section and render as bold edges in the map.
+
+**The map goes physical.** When at least one switch answers, `build_dot` switches to a physical layout: switch nodes, each device wired to its switch port (edge labeled with the interface), switch-to-switch uplinks, and Internet to gateway. With no reachable switch, it falls back to the logical gateway map from before.
+
+I targeted `pysnmp` 7.x, the current async line. Install it with `pip install pysnmp`. I tested the parsing, the access-port heuristic, correlation, the LLDP join, and the physical DOT render against Graphviz, and I ran all three failure modes: no community, an unreachable switch over the real async path, and pysnmp missing entirely.
+
+One caveat to plan for. Cisco switches often index the Bridge-MIB per VLAN through community string indexing, the `community@vlan` trick, so a single query can miss MACs in other VLANs. The Q-BRIDGE fallback covers many switches, but if a Cisco box returns thin results, per-VLAN community queries are the usual fix and a clean next step. SNMP also has to be enabled on each switch with the community you supply.
+Promp 5: 
+
+Harden this as a secure application. Add a required --authorized flag that forces the user to confirm they are permitted to scan the target before anything runs. Log all actions to a timestamped file. Validate and sanitize every input (CIDR, ports, switch IPs). Ensure the tool is read-only: it never modifies any device or switch. Never hardcode or store the SNMP community string; read it from an env var and keep it out of logs. Handle all network, permission, and SNMP errors gracefully, and cap scan concurrency and rate.
+Answer 6:
+Now the security hardening. Each requirement maps to a concrete change: a required `--authorized` gate, timestamped file logging that never records the community, a rate limiter plus a hard concurrency cap, defense-in-depth input checks, and a top-level error net. The tool already only does SNMP GET/GETNEXT, closed TCP connects, and ICMP echo, so read-only is preserved and made explicit. Let me apply it.
+
+Now the logging setup and the hardened `main` with the authorization gate, action logging, and the error net.
+
+Compiling and testing the hardening: authorization gate, logging, community never hitting the log, and rate limiting.
+
+Gate works and the refusal is logged. Now an authorized run with a secret community against an unreachable switch, then I'll grep the log to prove the community value never lands in it.
+
+Authorized run logs every action, records the community's source but never its value (leak check is CLEAN), and completes. Two more checks: the rate limiter actually throttles, the worker cap clamps, and the earlier logic still passes.
+
+All hardening checks pass: rate limiter throttles precisely, the worker cap clamps to 256, and nothing regressed. Committing the hardened file.
+
+Done. The hardened `app.py` is in your `hw6` folder. Every requirement is in place and tested.
+
+**Authorization gate.** `--authorized` is required. Without it the tool prints a refusal, logs the attempt, and exits 2 before touching the network. The check runs before any probe.
+
+**Logging.** Each run writes a timestamped file, `netdiscover-YYYYMMDD-HHMMSS.log` by default, or whatever you pass to `--log`. It records the authorized start with parameters, discovery results, gateway, per-switch SNMP status, the map write, and completion, each line stamped in ISO 8601. If the log file can't be opened, the scan still runs and warns.
+
+**Input validation.** CIDR, ports, and switch IPs all go through strict argparse validators that reject malformed input before anything starts. As defense in depth, `ping_host` re-checks that its target is a valid IP before calling out. No subprocess uses `shell=True`, so nothing user-supplied reaches a shell.
+
+**Read-only.** The tool only opens TCP connections and closes them at once, sends one ICMP echo per host, and issues SNMP GET and GETNEXT reads. It never calls SNMP SET and writes nothing to any device or switch. That guarantee is stated at the top of the file.
+
+**Community string.** It comes only from the `SNMP_COMMUNITY` environment variable or a no-echo prompt, never hardcoded. The log records the source ("SNMP_COMMUNITY env var") but never the value. I ran an authorized scan with a secret community against a switch and grepped both the log and the map: the secret appears in neither.
+
+**Error handling.** A top-level handler logs any unexpected failure and returns 1 with a one-line message instead of a traceback. Unreachable switches, missing pysnmp, no community, and map-write failures each degrade on their own path. Exit codes are 0 for success, 1 for errors, 2 for an unauthorized run.
+
+**Concurrency and rate caps.** `--workers` is hard-capped at 256 (I confirmed `-w 99999` clamps to 256 in the log). A rate limiter caps probe starts, default 100 hosts per second, adjustable with `--rate`. SNMP queries run at most 8 switches at once. The limiter timing checked out: 10 starts at 20 per second took 0.45 seconds.
+
+One thing to decide on your side. The default log file lands in the current directory, so running from `hw6` will drop `netdiscover-*.log` files there. If you'd rather keep them out of the repo, point `--log` somewhere else or add the pattern to `.gitignore`.
+Promp 6:
+
+Add a --self-test mode that discovers only the local host and loopback so the tool can be demonstrated without scanning a real network. Write a README.md covering usage, each flag, example commands, how to render the DOT map, how to supply the SNMP community string safely, and a "Security Considerations" section on authorized use and the read-only design.
+
+Answer 6:
+Now the `--self-test` mode and the README. First the code: I'll split discovery so it can probe an explicit host list, add local-host detection, make the target optional under self-test, and wire it into `main` (self-test skips the authorization gate and SNMP since it never touches a real network).
+
+Now the `main` rewrite to handle self-test.
+
+Now compile and exercise self-test mode: with no target and no `--authorized`, with a map, the missing-target error, and that `--switches` is ignored.
+
+Self-test runs with no target and no authorization, the missing-target error is clean, and `--switches` is ignored. Now a populated self-test with a live local port and a rendered map.
+
+Self-test is complete: it probes loopback and the local host, renders everything, and the map validates. Quick regression on the normal authorized path, then I'll write the README.
+
+Self-test and the normal path both work. Now the README.
+
+README's written. Final smoke test of the core logic after the refactor, then I'll commit both files.
+
+Both files are in your `hw6` folder now: the updated `app.py` and a new `README.md`.
+
+**`--self-test`.** It probes only loopback (`127.0.0.1`) and this machine's own IP, so you can demo the whole pipeline without touching a real network. It needs no target and no `--authorized`, and it disables SNMP, since the point is to contact nothing external. The local IP comes from a UDP-socket `connect` to a documentation address, which picks your outbound interface without sending any packets, with a hostname lookup as fallback. Under the hood I split `discover` into `discover_hosts` (probes an explicit list) and a thin `discover` wrapper, so self-test and normal scans share the same probe path. The table, tree, and map all render in demo mode. I confirmed it runs with no arguments, finds a live local port when one exists, writes a map that Graphviz renders, errors cleanly if you omit the target without `--self-test`, and ignores `--switches` with a note.
+
+**`README.md`.** It covers the overview, requirements, install, usage, every flag with its default, worked example commands, how to render the DOT map with `dot`, and how to supply the SNMP community string safely. The safe-community section explains that there's no CLI flag for it by design, so it can't leak into shell history or the process list, and that it never reaches the log. The "Security Considerations" section covers authorized use, the read-only design, credential handling, input validation, the concurrency and rate caps, and graceful failure, followed by the real limitations (single-subnet segment, same-subnet MAC visibility, the device-type heuristic, and Cisco per-VLAN community indexing).
+
+One thing worth deciding: the README tells readers to run `--self-test` first, which drops a `netdiscover-*.log` in the current directory. If you're committing this folder, add `netdiscover-*.log` to `.gitignore` so demo logs don't get tracked.
