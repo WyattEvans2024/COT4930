@@ -1,0 +1,5 @@
+2026-11-06T21:32:00-0500 INFO Authorized scan start: target=10.0.0.0/24 ports=22,80,443,445,3389 workers=100 rate=100.0/s switches=none
+2026-11-06T21:32:18-0500 INFO Discovery complete: 24 live of 254 scanned
+2026-11-06T21:32:28-0500 INFO Default gateway: 10.0.0.1
+2026-11-06T21:32:28-0500 INFO Network map written: net.dot
+2026-11-06T21:32:28-0500 INFO Scan complete

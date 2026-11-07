@@ -1,0 +1,63 @@
+graph network_map {
+  graph [rankdir=LR, fontname="Helvetica", fontsize=12];
+  node [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", fillcolor="#f5f5f5"];
+  edge [color="#888888"];
+
+  "internet" [label="Internet", shape=ellipse, style=filled, fillcolor="#dddddd"];
+
+  subgraph cluster_0 {
+    label="10.0.0.0/24";
+    style=rounded;
+    color="#4472c4";
+    fontname="Helvetica";
+    "10.0.0.1" [label="10.0.0.1\nTV/IoT\n[gateway]", shape=box3d];
+    "10.0.0.33" [label="10.0.0.33\nhost.docker.internal\ncomputer", shape=box];
+    "10.0.0.81" [label="10.0.0.81\nunknown", shape=box];
+    "10.0.0.82" [label="10.0.0.82\nunknown", shape=box];
+    "10.0.0.83" [label="10.0.0.83\nunknown", shape=box];
+    "10.0.0.86" [label="10.0.0.86\nunknown", shape=box];
+    "10.0.0.87" [label="10.0.0.87\nunknown", shape=box];
+    "10.0.0.88" [label="10.0.0.88\nunknown", shape=box];
+    "10.0.0.89" [label="10.0.0.89\nunknown", shape=box];
+    "10.0.0.90" [label="10.0.0.90\nunknown", shape=box];
+    "10.0.0.91" [label="10.0.0.91\nLAPTOP-KJHP54R7\ncomputer", shape=box];
+    "10.0.0.92" [label="10.0.0.92\nunknown", shape=box];
+    "10.0.0.93" [label="10.0.0.93\nunknown", shape=box];
+    "10.0.0.94" [label="10.0.0.94\nunknown", shape=box];
+    "10.0.0.95" [label="10.0.0.95\nunknown", shape=box];
+    "10.0.0.96" [label="10.0.0.96\nunknown", shape=box];
+    "10.0.0.97" [label="10.0.0.97\nunknown", shape=box];
+    "10.0.0.98" [label="10.0.0.98\nunknown", shape=box];
+    "10.0.0.99" [label="10.0.0.99\nunknown", shape=box];
+    "10.0.0.100" [label="10.0.0.100\nunknown", shape=box];
+    "10.0.0.133" [label="10.0.0.133\nunknown", shape=box];
+    "10.0.0.147" [label="10.0.0.147\nunknown", shape=box];
+    "10.0.0.177" [label="10.0.0.177\nunknown", shape=box];
+    "10.0.0.178" [label="10.0.0.178\nunknown", shape=box];
+  }
+
+  "internet" -- "10.0.0.1";
+  "10.0.0.1" -- "10.0.0.33";
+  "10.0.0.1" -- "10.0.0.81";
+  "10.0.0.1" -- "10.0.0.82";
+  "10.0.0.1" -- "10.0.0.83";
+  "10.0.0.1" -- "10.0.0.86";
+  "10.0.0.1" -- "10.0.0.87";
+  "10.0.0.1" -- "10.0.0.88";
+  "10.0.0.1" -- "10.0.0.89";
+  "10.0.0.1" -- "10.0.0.90";
+  "10.0.0.1" -- "10.0.0.91";
+  "10.0.0.1" -- "10.0.0.92";
+  "10.0.0.1" -- "10.0.0.93";
+  "10.0.0.1" -- "10.0.0.94";
+  "10.0.0.1" -- "10.0.0.95";
+  "10.0.0.1" -- "10.0.0.96";
+  "10.0.0.1" -- "10.0.0.97";
+  "10.0.0.1" -- "10.0.0.98";
+  "10.0.0.1" -- "10.0.0.99";
+  "10.0.0.1" -- "10.0.0.100";
+  "10.0.0.1" -- "10.0.0.133";
+  "10.0.0.1" -- "10.0.0.147";
+  "10.0.0.1" -- "10.0.0.177";
+  "10.0.0.1" -- "10.0.0.178";
+}
