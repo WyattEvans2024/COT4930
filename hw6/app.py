@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Network discovery command-line tool.
 
-Given a target network in CIDR notation, this tool discovers live hosts and
-enriches each one with identifying detail.
+Given a target network in CIDR notation, this tool discovers live hosts,
+enriches each one, groups them into network segments, and can export a map.
 
 Discovery uses two complementary probes per host:
 
@@ -21,7 +21,10 @@ Each live host is then enriched with:
 * its hostname, via reverse DNS,
 * a best-guess device type, inferred from the open ports and the vendor.
 
-Only the Python standard library is used.
+Finally, hosts are grouped by subnet and default gateway into segments. The
+result is printed as a table, printed again as an indented text tree, and can
+be exported as a Graphviz DOT file (``--map FILE``) for rendering as a network
+map. Only the Python standard library is used.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Optional, Sequence, Union
+from typing import Callable, Optional, Sequence, Union
 
 IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
@@ -157,6 +160,27 @@ class HostResult:
     def is_live(self) -> bool:
         """Return whether either discovery probe found the host to be up."""
         return bool(self.open_ports) or self.pinged
+
+
+@dataclass
+class Segment:
+    """A group of devices sharing a subnet and default gateway.
+
+    Attributes:
+        network: The subnet in CIDR notation, for example ``"192.168.1.0/24"``.
+        gateway: The default-gateway IP within this subnet, or ``None`` if none
+            is known (for example when scanning a remote subnet).
+        devices: The discovered live hosts in this subnet, sorted by address.
+        gateway_device: The gateway as a renderable node. It is the matching
+            entry from ``devices`` when the gateway was discovered, a separate
+            enriched node when the gateway was not discovered live, or ``None``
+            when no gateway is known.
+    """
+
+    network: str
+    gateway: Optional[str]
+    devices: list[HostResult]
+    gateway_device: Optional[HostResult] = None
 
 
 def parse_cidr(value: str) -> IPNetwork:
@@ -430,6 +454,14 @@ def _is_ip_address(value: str) -> bool:
     return True
 
 
+def _ip_in_network(ip: str, network: IPNetwork) -> bool:
+    """Return whether an IP string falls within a network."""
+    try:
+        return ipaddress.ip_address(ip) in network
+    except ValueError:
+        return False
+
+
 def _parse_ip_neigh(output: str) -> dict[str, str]:
     """Parse ``ip neigh`` output into an IP-to-MAC mapping.
 
@@ -504,6 +536,103 @@ def read_neighbor_table() -> dict[str, str]:
     if output is not None:
         return _parse_arp(output)
     return {}
+
+
+def _parse_gateway_ip_route(output: str) -> Optional[str]:
+    """Pull the gateway IP from ``ip route`` output (Linux iproute2).
+
+    Looks for a line like ``default via 192.168.1.1 dev eth0``.
+    """
+    for line in output.splitlines():
+        tokens = line.split()
+        if tokens and tokens[0] == "default" and "via" in tokens:
+            candidate = tokens[tokens.index("via") + 1]
+            if _is_ip_address(candidate):
+                return candidate
+    return None
+
+
+def _parse_gateway_route_print(output: str) -> Optional[str]:
+    """Pull the gateway IP from Windows ``route print`` output.
+
+    Looks for an active-route line whose destination and mask are both
+    ``0.0.0.0``; the third column is the gateway.
+    """
+    for line in output.splitlines():
+        tokens = line.split()
+        if (
+            len(tokens) >= 3
+            and tokens[0] == "0.0.0.0"
+            and tokens[1] == "0.0.0.0"
+            and _is_ip_address(tokens[2])
+        ):
+            return tokens[2]
+    return None
+
+
+def _parse_gateway_route_get(output: str) -> Optional[str]:
+    """Pull the gateway IP from macOS ``route -n get default`` output.
+
+    Looks for a line like ``    gateway: 192.168.1.1``.
+    """
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("gateway:"):
+            candidate = stripped.split(":", 1)[1].strip()
+            if _is_ip_address(candidate):
+                return candidate
+    return None
+
+
+def _parse_gateway_default_row(output: str) -> Optional[str]:
+    """Pull the gateway IP from ``netstat -rn`` or ``route -n`` output.
+
+    Looks for a line whose first column is ``default`` (BSD/macOS) or ``0.0.0.0``
+    (Linux net-tools); the second column is the gateway.
+    """
+    for line in output.splitlines():
+        tokens = line.split()
+        if (
+            len(tokens) >= 2
+            and tokens[0] in ("default", "0.0.0.0")
+            and _is_ip_address(tokens[1])
+        ):
+            return tokens[1]
+    return None
+
+
+def detect_default_gateway() -> Optional[str]:
+    """Detect this machine's IPv4 default gateway from the routing table.
+
+    Tries platform-appropriate commands in turn and returns the first gateway
+    IP found. This is the local machine's gateway; it identifies a segment's
+    router only when the scanned subnet is the local subnet.
+
+    Returns:
+        The gateway IP as a string, or ``None`` if it could not be determined.
+    """
+    system = platform.system().lower()
+    attempts: list[tuple[list[str], Callable[[str], Optional[str]]]]
+    if system == "windows":
+        attempts = [(["route", "print"], _parse_gateway_route_print)]
+    elif system == "darwin":
+        attempts = [
+            (["route", "-n", "get", "default"], _parse_gateway_route_get),
+            (["netstat", "-rn"], _parse_gateway_default_row),
+        ]
+    else:
+        attempts = [
+            (["ip", "route"], _parse_gateway_ip_route),
+            (["route", "-n"], _parse_gateway_default_row),
+        ]
+
+    for cmd, parser in attempts:
+        output = _run_command(cmd)
+        if output:
+            gateway = parser(output)
+            if gateway:
+                return gateway
+    return None
 
 
 def lookup_vendor(mac: Optional[str]) -> Optional[str]:
@@ -595,7 +724,7 @@ def enrich_host(result: HostResult, neighbors: dict[str, str]) -> None:
     """Fill in the MAC, vendor, hostname, and device-type fields of a result.
 
     Args:
-        result: A live :class:`HostResult` to enrich in place.
+        result: A :class:`HostResult` to enrich in place.
         neighbors: The IP-to-MAC mapping from :func:`read_neighbor_table`.
     """
     result.mac = neighbors.get(result.ip)
@@ -604,25 +733,239 @@ def enrich_host(result: HostResult, neighbors: dict[str, str]) -> None:
     result.device_type = guess_device_type(result.open_ports, result.vendor)
 
 
-def enrich_live_hosts(results: Sequence[HostResult], workers: int) -> None:
+def enrich_hosts(
+    results: Sequence[HostResult], neighbors: dict[str, str], workers: int
+) -> None:
     """Enrich every live host in place, concurrently.
 
-    Reads the neighbor table once (after the ping sweep has populated it), then
-    runs per-host enrichment across a thread pool, mainly to overlap the
+    Runs per-host enrichment across a thread pool, mainly to overlap the
     reverse-DNS lookups.
 
     Args:
         results: All host results from :func:`discover`.
+        neighbors: The IP-to-MAC mapping from :func:`read_neighbor_table`.
         workers: Maximum number of worker threads.
     """
-    neighbors = read_neighbor_table()
     live = [result for result in results if result.is_live]
     if not live:
         return
     with ThreadPoolExecutor(max_workers=min(workers, len(live))) as executor:
-        futures = [executor.submit(enrich_host, result, neighbors) for result in live]
+        futures = [
+            executor.submit(enrich_host, result, neighbors) for result in live
+        ]
         for future in as_completed(futures):
             future.result()
+
+
+def group_into_segments(
+    results: Sequence[HostResult],
+    network: IPNetwork,
+    gateway: Optional[str],
+    neighbors: dict[str, str],
+) -> list[Segment]:
+    """Group live hosts into network segments by subnet and gateway.
+
+    This tool scans a single CIDR, so it forms exactly one segment: the scanned
+    subnet. The return type is a list so the renderers also support a future
+    multi-subnet scan with no change. The default gateway is attached only when
+    it falls inside the scanned subnet; when it was not itself discovered live,
+    a separate enriched node is built for it so the map still shows the router.
+
+    Args:
+        results: All host results from :func:`discover`.
+        network: The scanned network.
+        gateway: The detected default gateway IP, or ``None``.
+        neighbors: The IP-to-MAC mapping, used to enrich an undiscovered gateway.
+
+    Returns:
+        A list holding the single segment for the scanned subnet.
+    """
+    live = sorted(
+        (result for result in results if result.is_live),
+        key=lambda result: ipaddress.ip_address(result.ip),
+    )
+
+    gateway_ip = gateway if (gateway and _ip_in_network(gateway, network)) else None
+    gateway_device: Optional[HostResult] = None
+    if gateway_ip:
+        match = next((host for host in live if host.ip == gateway_ip), None)
+        if match is not None:
+            gateway_device = match
+        else:
+            # The gateway ignored our probes but is still a real device.
+            gateway_device = HostResult(ip=gateway_ip)
+            enrich_host(gateway_device, neighbors)
+
+    segment = Segment(
+        network=str(network),
+        gateway=gateway_ip,
+        devices=live,
+        gateway_device=gateway_device,
+    )
+    return [segment]
+
+
+def format_tree(segments: Sequence[Segment]) -> str:
+    """Render the segment grouping as an indented ASCII tree.
+
+    Args:
+        segments: The segments to render.
+
+    Returns:
+        The tree as a single string, without a trailing newline.
+    """
+    lines = ["network"]
+    for seg_index, segment in enumerate(segments):
+        seg_last = seg_index == len(segments) - 1
+        seg_branch = "`-- " if seg_last else "|-- "
+        gateway_text = (
+            f"(gateway: {segment.gateway})" if segment.gateway else "(gateway: unknown)"
+        )
+        lines.append(f"{seg_branch}{segment.network}  {gateway_text}")
+        child_prefix = "    " if seg_last else "|   "
+
+        # List the gateway first when it was not among the discovered devices.
+        members = list(segment.devices)
+        if segment.gateway_device is not None and segment.gateway_device not in members:
+            members = [segment.gateway_device] + members
+
+        if not members:
+            lines.append(f"{child_prefix}`-- (no live hosts)")
+            continue
+
+        ip_width = max(len(host.ip) for host in members)
+        host_width = max(len(host.hostname or "-") for host in members)
+        vendor_width = max(len(host.vendor or "-") for host in members)
+
+        for dev_index, host in enumerate(members):
+            dev_last = dev_index == len(members) - 1
+            dev_branch = "`-- " if dev_last else "|-- "
+            is_gateway = (
+                segment.gateway_device is not None
+                and host.ip == segment.gateway_device.ip
+            )
+            marker = "  [gateway]" if is_gateway else ""
+            line = (
+                f"{child_prefix}{dev_branch}"
+                f"{host.ip.ljust(ip_width)}  "
+                f"{(host.hostname or '-').ljust(host_width)}  "
+                f"{(host.vendor or '-').ljust(vendor_width)}  "
+                f"{host.device_type}{marker}"
+            )
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _dot_escape(text: str) -> str:
+    """Escape a string for use inside a double-quoted DOT label."""
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _dot_node_id(ip: str) -> str:
+    """Return a quoted DOT node id for an IP address."""
+    return '"' + ip + '"'
+
+
+def _dot_label(host: HostResult, is_gateway: bool) -> str:
+    """Build a multi-line DOT node label for a host."""
+    parts = [host.ip]
+    if host.hostname:
+        parts.append(host.hostname)
+    if host.vendor:
+        parts.append(host.vendor)
+    parts.append(host.device_type)
+    if is_gateway:
+        parts.append("[gateway]")
+    return "\\n".join(_dot_escape(part) for part in parts)
+
+
+def build_dot(segments: Sequence[Segment]) -> str:
+    """Build a Graphviz DOT document for the segment model.
+
+    Each segment becomes a cluster. Within a segment, devices connect to a hub:
+    the gateway node when one is known (which in turn connects to an "Internet"
+    node), or a synthetic segment node otherwise. Render the output with, for
+    example, ``dot -Tpng map.dot -o map.png``.
+
+    Args:
+        segments: The segments to render.
+
+    Returns:
+        The DOT document as a string, ending with a newline.
+    """
+    out: list[str] = []
+    out.append("graph network_map {")
+    out.append('  graph [rankdir=LR, fontname="Helvetica", fontsize=12];')
+    out.append(
+        '  node [fontname="Helvetica", fontsize=10, shape=box, '
+        'style="rounded,filled", fillcolor="#f5f5f5"];'
+    )
+    out.append('  edge [color="#888888"];')
+    out.append("")
+
+    if any(segment.gateway_device for segment in segments):
+        out.append(
+            '  "internet" [label="Internet", shape=ellipse, '
+            'style=filled, fillcolor="#dddddd"];'
+        )
+        out.append("")
+
+    # Node declarations, grouped into one cluster per segment.
+    for index, segment in enumerate(segments):
+        out.append(f"  subgraph cluster_{index} {{")
+        out.append(f'    label="{_dot_escape(segment.network)}";')
+        out.append("    style=rounded;")
+        out.append('    color="#4472c4";')
+        out.append('    fontname="Helvetica";')
+
+        members = list(segment.devices)
+        if (
+            segment.gateway_device is not None
+            and segment.gateway_device not in members
+        ):
+            members = members + [segment.gateway_device]
+
+        if not members:
+            out.append(
+                f'    "seg{index}_empty" '
+                '[label="(no live hosts)", shape=plaintext, style=""];'
+            )
+        for host in members:
+            is_gateway = (
+                segment.gateway_device is not None
+                and host.ip == segment.gateway_device.ip
+            )
+            shape = "box3d" if is_gateway else "box"
+            out.append(
+                f'    {_dot_node_id(host.ip)} '
+                f'[label="{_dot_label(host, is_gateway)}", shape={shape}];'
+            )
+
+        if segment.gateway_device is None and segment.devices:
+            out.append(
+                f'    "seg{index}_hub" '
+                f'[label="{_dot_escape(segment.network)}\\n(segment)", '
+                'shape=ellipse, style=filled, fillcolor="#dddddd"];'
+            )
+        out.append("  }")
+        out.append("")
+
+    # Edges.
+    for index, segment in enumerate(segments):
+        if segment.gateway_device is not None:
+            hub = _dot_node_id(segment.gateway_device.ip)
+            out.append(f'  "internet" -- {hub};')
+            for host in segment.devices:
+                if host.ip == segment.gateway_device.ip:
+                    continue
+                out.append(f"  {hub} -- {_dot_node_id(host.ip)};")
+        elif segment.devices:
+            hub = f'"seg{index}_hub"'
+            for host in segment.devices:
+                out.append(f"  {hub} -- {_dot_node_id(host.ip)};")
+
+    out.append("}")
+    return "\n".join(out) + "\n"
 
 
 def print_report(results: Sequence[HostResult], total: int) -> None:
@@ -681,8 +1024,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Discover live hosts on a network with TCP connect probes and a "
-            "single ICMP ping per host, then enrich each with MAC, vendor, "
-            "hostname, and a device-type guess."
+            "single ICMP ping per host, enrich each with MAC, vendor, hostname "
+            "and a device-type guess, then group them into segments."
         )
     )
     parser.add_argument(
@@ -717,6 +1060,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_WORKERS,
         help=f"Worker thread count (default: {DEFAULT_WORKERS}).",
     )
+    parser.add_argument(
+        "--map",
+        dest="map_file",
+        metavar="FILE",
+        help="Write the network map as a Graphviz DOT file to FILE.",
+    )
     return parser
 
 
@@ -727,7 +1076,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         argv: Argument list to parse. Defaults to ``sys.argv[1:]``.
 
     Returns:
-        A process exit code: 0 on success.
+        A process exit code: 0 on success, 1 if the map file could not be
+        written.
     """
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -740,8 +1090,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     results = discover(args.cidr, args.ports, args.timeout, args.workers)
-    enrich_live_hosts(results, args.workers)
+    neighbors = read_neighbor_table()
+    enrich_hosts(results, neighbors, args.workers)
+    gateway = detect_default_gateway()
+    segments = group_into_segments(results, args.cidr, gateway, neighbors)
+
     print_report(results, total)
+    print()
+    print(format_tree(segments))
+
+    if args.map_file:
+        dot = build_dot(segments)
+        try:
+            with open(args.map_file, "w", encoding="utf-8") as handle:
+                handle.write(dot)
+        except OSError as exc:
+            print(f"error: could not write map to {args.map_file}: {exc}", file=sys.stderr)
+            return 1
+        print()
+        print(f"Network map written to {args.map_file}")
+        print(f"Render it with: dot -Tpng {args.map_file} -o network_map.png")
     return 0
 
 
